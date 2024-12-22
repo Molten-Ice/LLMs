@@ -1,13 +1,3 @@
-# %%
-# Plan:
-# 1. Follow andrej tutorial to code a basic transformer
-# 3. Modify it to make multiple heads work in one.
-
-# Finetuning
-# 1. Getting gemini flash to generate a dataset.
-# 2. Retrain on the new dataset to finetune it.
-# 3. Add LoRA in as well
-
 # %% [markdown]
 # ## Misc
 
@@ -263,8 +253,8 @@ learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 384
-n_head = 4
-n_layer = 4
+n_head = 6
+n_layer = 6
 dropout = 0.2
 # ------------
 
@@ -313,15 +303,55 @@ def estimate_loss(model):
     return out
 
 debug = False
-class Head(nn.Module):
-    """ one head of self-attention """
 
-    def __init__(self):
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, bias=True):
         super().__init__()
+        assert n_embd % n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=bias)
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.dropout = dropout
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size))
+                                        .view(1, 1, block_size, block_size))
 
-        # self.dropout = nn.Dropout(dropout)
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 class MultiHeadAttention(nn.Module):
     """ multiple heads of self-attention in parallel """
@@ -385,13 +415,15 @@ class Block(nn.Module):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
         head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
+        # self.attn = MultiHeadAttention(n_head, head_size)
+        self.attn = CausalSelfAttention()
         self.ffwd = FeedFoward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x))
+        # Only normalized over embedding. Batch and time act as batch dimension.
+        x = x + self.attn(self.ln1(x)) 
         x = x + self.ffwd(self.ln2(x))
         return x
 
@@ -457,7 +489,7 @@ class GPTLanguageModel(nn.Module):
 
 torch.manual_seed(3)
 model = GPTLanguageModel()
-save_path = 'models/model_weights_10_1-2260.pth'
+save_path = 'models/model_weights_13_1-2572.pth'
 model.load_state_dict(torch.load(save_path, weights_only=True))
 model = model.to(device)
 # print the number of parameters in the model
@@ -467,40 +499,25 @@ print(f'{sum(p.numel() for p in model.parameters())/1e6:.2f} Million parameters'
 # tor
 import random
 seed = random.randint(0, 1000)
+seed = 3
 print(f'seed: {seed}')
 torch.manual_seed(seed)
 model.eval()
 context = torch.randint(0, vocab_size, (1, 2), device=device)
-print(decode(model.generate(context, max_new_tokens=1000)[0].tolist()))
+with open('generated.txt', 'w', encoding='utf-8') as f:
+    f.write(decode(model.generate(context, max_new_tokens=10000)[0].tolist()))
+###
 
-# %%
-7.26 Million parameters
-seed: 563
-)Do you know? You mean Seldon did, excellence, and the personal father he 
-and whigh it's expansion what made an independent from now, you know. You know, there's nothing about it, 
-Terminus and if at all, remember to where do you were suwdenly complete increase. We've got of the 
-Foundation and Empire of complication makes can or place of Convention." 
+total_params = 0
+for name, param in model.named_parameters():
+    num_params = param.numel()
+    total_params += num_params
+    if num_params > 10000:
+        print(f'{name}: {num_params:,} parameters')
 
-"I will respect to are told you what you that you have lost on Dr. Darell? 
+print(f'\nTotal: {total_params:,} parameters ({total_params/1e6:.2f}M)')
 
-"I'm not out of all with you." He bent a rod down in a point. "What are you late?" 
-
-Barr said to Gaal's air peevish and ashoot to the trader's eyes to do. "Think he when we three 
-thousand have failed from the states." 
-
-The man spread and his waited muzzled with sudden massive his belt. It got a force of a minute 
-prince's hand. "You can't say it's when Pritcher?" 
-
-"Yes, because it worked, my Lepold. Let me by the vessal with your station. Lime." 
-
-"What about the great days have everything of those taxtions? It seems be no casual of interests, at sover are 
-
-
-# %%
-
-
-# %%
-####
+### training loop ###
 
 import os
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -534,19 +551,13 @@ for iter in range(max_iters):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
-
-model.eval()
-os.makedirs('models', exist_ok=True)
-folder_size = len(os.listdir('models'))+1
-save_path = f'models/model_weights_{folder_size}.pth'
-torch.save(model.state_dict(), save_path)
-print(f"save_path = '{save_path}'")
 # step 2499: train loss 1.1224, val loss 1.3344
 
 # %%
 
 
 # %%
+print(f'{sum(p.numel() for p in model.parameters())/1e6:.2f} Million parameters')
 
 
 # %%

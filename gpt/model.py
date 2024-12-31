@@ -52,9 +52,8 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
         self.c_attn_cache = None
-        self.first_pass = True
 
-    def forward(self, x):
+    def forward(self, x, first_pass=True):
         """What to cache, that is the question.
 
         - All keys, values but not queries (Note: q @ k.T so only bottom query/query for most recent token is needed)
@@ -67,10 +66,11 @@ class CausalSelfAttention(nn.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         t0 = time.time()
         # Ideally just cache kv, not q.
-        if self.c_attn_cache is None: # Awfully inefficient but demonstrates the principle
+        if first_pass: # Awfully inefficient but demonstrates the principle
             proj = self.c_attn(x)
             self.c_attn_cache = proj
         else:
+            assert self.c_attn_cache is not None
             last_layer = x[:, [-1], :]
             last_proj = self.c_attn(last_layer)
             proj = torch.cat([self.c_attn_cache, last_proj], dim=1).contiguous()
@@ -99,8 +99,7 @@ class CausalSelfAttention(nn.Module):
         #         [0.4673, 0.5327, 0.0000, 0.0000],
         #         [0.0990, 0.0756, 0.8254, 0.0000],
         #         [0.2440, 0.1306, 0.1306, 0.4948]], device='cuda:0')
-        if self.first_pass:
-            self.first_pass = False
+        if first_pass:
             t0 = time.time()
             if self.flash:
                 # efficient attention using Flash Attention CUDA kernels
@@ -143,13 +142,12 @@ class CausalSelfAttention(nn.Module):
                 att = self.attn_dropout(att) # shape: torch.Size([1, 12, 1, 4])
                 end_y = att @ v
             end_y = self.resid_dropout(self.c_proj(end_y.contiguous().view(B, 1, -1)))
-            # Doing device= here instead of a register_buffer seems bad practice - investigate.
-            y = torch.cat([torch.zeros((B, T-1, C), device=x.device), end_y], dim=1)
-            return y
+            print(end_y.shape)
+            return end_y
 
     def reset_cache(self):
         self.c_attn_cache = None
-        self.first_pass = True
+
 
 class MLP(nn.Module):
 
@@ -163,25 +161,15 @@ class MLP(nn.Module):
 
         self.mlp_cache = None
 
-    def forward(self, x):
+    def forward(self, x, first_pass=True):
         B, T, C = x.shape
-        y = x if self.mlp_cache is None else x[:, [-1], :]
+        y = x if first_pass else x[:, [-1], :]
         y = self.c_fc(y)
         y = self.gelu(y)
         y = self.c_proj(y)
         y = self.dropout(y)
+        return y
 
-
-        if self.mlp_cache is None:
-            self.mlp_cache = y
-        else:
-            self.mlp_cache = torch.cat([self.mlp_cache, y], dim=1).contiguous()
-
-        assert self.mlp_cache.shape == x.shape, f'mlp cache shape: {self.mlp_cache.shape} != x shape: {x.shape}'
-        return self.mlp_cache
-
-    def reset_cache(self):
-        self.mlp_cache = None
 
 class Block(nn.Module):
 
@@ -192,17 +180,23 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, block_num)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config, block_num)
+        self.first_pass = True
 
     def forward(self, x):
-        t0 = time.time()
-        x = x + self.attn(self.ln_1(x))
-        t0 = time.time()
-        x = x + self.mlp(self.ln_2(x))
+        if self.first_pass:
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
+        else:
+            x[:, [-1], :] = x[:, [-1], :] + self.attn(self.ln_1(x[:, [-1], :]))
+            x[:, [-1], :] = x[:, [-1], :] + self.mlp(self.ln_2(x[:, [-1], :]))
+
+        self.first_pass = False
         return x
     
     def reset_cache(self):
+        self.first_pass = True
         self.attn.reset_cache()
-        self.mlp.reset_cache()
+
 
 @dataclass
 class GPTConfig:

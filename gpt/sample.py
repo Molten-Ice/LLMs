@@ -12,9 +12,9 @@ top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 p
 seed = 3
 device = 'cuda'
 dtype = 'bfloat16' if torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 
-init_from = 'gpt2-xl' # 'gpt2-xl'
+init_from = 'gpt2' # 'gpt2-xl'
 start = "What is the answer to life, the universe, and everything?" # "\n" # or "<|endoftext|>" or etc.
 # start = 'Hello world!'
 # start = "Asimov foundation trilogy:"
@@ -41,9 +41,6 @@ decode = lambda l: enc.decode(l)
 start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
-max_new_tokens = 100
-print(f'x.shape: {x.shape}, max_new_tokens: {max_new_tokens}')
-
 # My kv caching actually is slower than the original :) (lol)
 
 # For 100 tokens:
@@ -52,7 +49,9 @@ print(f'x.shape: {x.shape}, max_new_tokens: {max_new_tokens}')
 
 # Successful slowdown :[]
 
-num_sequences = 5
+max_new_tokens = 10
+print(f'x.shape: {x.shape}, max_new_tokens: {max_new_tokens}')
+num_sequences = 1
 
 output = []
 with torch.no_grad():

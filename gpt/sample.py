@@ -41,9 +41,6 @@ decode = lambda l: enc.decode(l)
 start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
-max_new_tokens = 2
-print(f'x.shape: {x.shape}, max_new_tokens: {max_new_tokens}')
-
 # My kv caching actually is slower than the original :) (lol)
 
 # For 100 tokens:
@@ -52,6 +49,8 @@ print(f'x.shape: {x.shape}, max_new_tokens: {max_new_tokens}')
 
 # Successful slowdown :[]
 
+max_new_tokens = 10
+print(f'x.shape: {x.shape}, max_new_tokens: {max_new_tokens}')
 num_sequences = 1
 
 output = []

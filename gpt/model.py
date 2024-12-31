@@ -7,6 +7,12 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+#To add:
+# - MoE
+# - RoPE
+# - Hyper-connections
+# - Better init
+
 import time
 import math
 import inspect
@@ -66,22 +72,14 @@ class CausalSelfAttention(nn.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         t0 = time.time()
         # Ideally just cache kv, not q.
-        if first_pass: # Awfully inefficient but demonstrates the principle
+        if self.c_attn_cache is None: # Awfully inefficient but demonstrates the principle
             proj = self.c_attn(x)
             self.c_attn_cache = proj
         else:
-            assert self.c_attn_cache is not None
             last_layer = x[:, [-1], :]
             last_proj = self.c_attn(last_layer)
             proj = torch.cat([self.c_attn_cache, last_proj], dim=1).contiguous()
             self.c_attn_cache = proj
-
-        # print(proj[0, :, 3]) if self.block_num == 0 else None
-        # tensor([-1.2188, -0.0544, -0.3262, -1.2422, -0.1533,  0.2070, -0.8516, -0.2051,
-        # -0.2012, -0.8359, -0.1455,  0.3672,  0.1602], device='cuda:0', dtype=torch.bfloat16)
-        # --- New token (1) ---
-        # tensor([-1.2188, -0.0544, -0.3262, -1.2422, -0.1533,  0.2070, -0.8516, -0.2051,
-        #         -0.2012, -0.8359, -0.1455,  0.3672,  0.1602,  0.2314], device='cuda:0',
 
         q, k, v  = proj.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -117,37 +115,19 @@ class CausalSelfAttention(nn.Module):
             y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
             y = self.resid_dropout(self.c_proj(y))
             return y
+
+        if self.flash:
+            end_y = torch.nn.functional.scaled_dot_product_attention(q[:, :, [-1], :], k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
         else:
-            # Don't exactly match -0.1006 vs -0.1001 - assuming some floating point issues are causing this.
-            # caching: tensor([[ 0.0889,  0.1338, -0.0640,  0.0393,  0.0072, -0.0216, -0.1006,  0.0269]],
-            # functional: tensor([[ 0.0889,  0.1328, -0.0640,  0.0393,  0.0072, -0.0216, -0.1001,  0.0269]],
-            # y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-
-            # Calculate bottom row in attn matrix multipled by values.
-            # q shape: torch.Size([1, 12, 4, 64]),  k shape: torch.Size([1, 12, 4, 64]). Normally (4 x 64) @ (64 x 4)
-            # (1 x 64) @ (64 x 4) -> (1 x 4)
-
-            # Very similar but not identical - -0.1309 vs -0.1299 seems significant but I'm not sure of the cause.
-            # print(y[0, -1, :, :10])
-            # temp: tensor([[[-0.1309,  1.0391,  0.4355,  0.7383, -0.5117, -0.7461, -0.6641,
-            #         -0.0850,  0.4316, -0.7188]]], device='cuda:0', dtype=torch.bfloat16)
-            # tensor([[[-0.1299,  1.0391,  0.4355,  0.7383, -0.5117, -0.7461, -0.6641,
-            #         -0.0854,  0.4316, -0.7148]]], device='cuda:0', dtype=torch.bfloat16)
-
-            if self.flash:
-                end_y = torch.nn.functional.scaled_dot_product_attention(q[:, :, [-1], :], k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
-            else:
-                att = (q[:, :, [-1], :] @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                att = F.softmax(att, dim=-1)
-                att = self.attn_dropout(att) # shape: torch.Size([1, 12, 1, 4])
-                end_y = att @ v
-            end_y = self.resid_dropout(self.c_proj(end_y.contiguous().view(B, 1, -1)))
-            print(end_y.shape)
-            return end_y
+            att = (q[:, :, [-1], :] @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att) # shape: torch.Size([1, 12, 1, 4])
+            end_y = att @ v
+        end_y = self.resid_dropout(self.c_proj(end_y.contiguous().view(B, 1, -1)))
+        return end_y
 
     def reset_cache(self):
         self.c_attn_cache = None
-
 
 class MLP(nn.Module):
 
@@ -159,16 +139,12 @@ class MLP(nn.Module):
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
-        self.mlp_cache = None
-
     def forward(self, x, first_pass=True):
-        B, T, C = x.shape
-        y = x if first_pass else x[:, [-1], :]
-        y = self.c_fc(y)
-        y = self.gelu(y)
-        y = self.c_proj(y)
-        y = self.dropout(y)
-        return y
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
 
 
 class Block(nn.Module):
@@ -180,22 +156,15 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, block_num)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config, block_num)
-        self.first_pass = True
 
-    def forward(self, x):
-        if self.first_pass:
+    def forward(self, x, first_pass=True):
+        if first_pass:
             x = x + self.attn(self.ln_1(x))
             x = x + self.mlp(self.ln_2(x))
         else:
-            x[:, [-1], :] = x[:, [-1], :] + self.attn(self.ln_1(x[:, [-1], :]))
-            x[:, [-1], :] = x[:, [-1], :] + self.mlp(self.ln_2(x[:, [-1], :]))
-
-        self.first_pass = False
+            x[:, [-1], :] = x[:, [-1], :] + self.attn(self.ln_1(x), first_pass=first_pass)
+            x[:, [-1], :] = x[:, [-1], :] + self.mlp(self.ln_2(x[:, [-1], :]), first_pass=first_pass)
         return x
-    
-    def reset_cache(self):
-        self.first_pass = True
-        self.attn.reset_cache()
 
 
 @dataclass
@@ -242,7 +211,7 @@ class GPT(nn.Module):
 
     def reset_cache(self):
         for block in self.transformer.h:
-            block.reset_cache()
+            block.attn.reset_cache()
 
     def get_num_params(self, non_embedding=True):
         """
@@ -264,7 +233,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, first_pass=True):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -276,7 +245,7 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, first_pass=first_pass)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -414,7 +383,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond, first_pass=token_num == 0)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

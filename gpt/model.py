@@ -59,7 +59,7 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
  
-    def forward(self, x, kv_pair=None):
+    def forward(self, x, kv_pair=None, store_kv_cache=True):
         """What to cache, that is the question.
 
         - All keys, values but not queries (Note: q @ k.T so only bottom query/query for most recent token is needed)
@@ -102,7 +102,7 @@ class CausalSelfAttention(nn.Module):
         T = q.size(2)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         y = self.resid_dropout(self.c_proj(y))
-        return y, (k, v)
+        return y, (k, v) if store_kv_cache else (y, None)
 
 
 class MLP(nn.Module):
@@ -123,6 +123,8 @@ class MLP(nn.Module):
         return x
 
 
+
+
 class Block(nn.Module):
 
     def __init__(self, config, block_num):
@@ -133,11 +135,23 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config, block_num)
 
-    def forward(self, x, kv_pair=None):
-        attn_out, kv_pair = self.attn(self.ln_1(x), kv_pair)
+    def forward(self, x, kv_pair=None, store_kv_cache=True):
+        x_before = x.clone()
+        attn_out, kv_pair = self.attn(self.ln_1(x), kv_pair, store_kv_cache=store_kv_cache)
         x = x + attn_out
+        x_attn = x.clone()
         x = x + self.mlp(self.ln_2(x))
-        return x, kv_pair
+        x_after = x.clone()
+
+        eps = 1e-8  # Small epsilon to prevent division by zero
+        stats = {
+            'sim_attn':  F.cosine_similarity(x_before, x_attn, dim=-1),
+            'dist_attn': torch.norm(x_attn, dim=-1) / (torch.norm(x_before, dim=-1) + eps),
+            'sim_mlp': F.cosine_similarity(x_attn, x_after, dim=-1),
+            'dist_mlp': torch.norm(x_after, dim=-1) / (torch.norm(x_attn, dim=-1) + eps)
+        }
+    
+        return x, kv_pair, stats
 
 
 @dataclass
@@ -203,7 +217,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, kv_pairs=None):
+    def forward(self, idx, targets=None, kv_pairs=None, store_kv_cache=True):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -217,14 +231,16 @@ class GPT(nn.Module):
         T = x.size(1)
 
         new_kv_pairs = []
+        all_stats = []
         for block_num in range(self.config.n_layer):
             block = self.transformer.h[block_num]
             if kv_pairs is None:
-                x, new_kv_pair = block(x)
+                x, new_kv_pair, stats = block(x, store_kv_cache=store_kv_cache)
             else:
                 x = x[:, [-1], :]
-                x, new_kv_pair = block(x, kv_pairs[block_num])
+                x, new_kv_pair, _ = block(x, kv_pairs[block_num])
             new_kv_pairs.append(new_kv_pair)
+            all_stats.append(stats)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -236,7 +252,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss, new_kv_pairs
+        return logits, loss, new_kv_pairs, all_stats
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -362,7 +378,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _, kv_pairs = self(idx_cond, kv_pairs=kv_pairs)
+            logits, _, kv_pairs, _ = self(idx_cond, kv_pairs=None)# kv_pairs)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
